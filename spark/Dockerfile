@@ -13,7 +13,7 @@ USER root
 # -> it crashes with `InvalidVersion: '2004d'` on modern wheel metadata. `python3 -m
 # pip` always uses the module we just upgraded.
 #
-# PINS / WORKAROUNDS (each one was hit the hard way - see NOTES.md):
+# PINS / WORKAROUNDS (see the troubleshooting section in README.md):
 #   notebook<7        -> GE 0.18 depends on notebook, which drags in jupyterlab>=4.4.9
 #                        (Python 3.9+ only). Pin to the last 3.8-compatible notebook.
 #   dbt-spark (plain) -> the [session] extra pip-installs the ~300MB pyspark wheel.

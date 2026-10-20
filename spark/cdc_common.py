@@ -1,7 +1,7 @@
 """
-Shared helpers for the Day 2 lakehouse jobs (Bronze + Silver).
+Shared helpers for the Bronze + Silver lakehouse jobs.
 
-Everything here is plain PySpark - open DAY2_STEPS.md for the concept map.
+Everything here is plain PySpark; see README.md for the architecture.
 """
 import os
 

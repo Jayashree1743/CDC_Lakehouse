@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-DAY 1 (optional bonus): Traffic Simulator
-=========================================
-Plays the role of FinContract Corp's real application: constantly inserts,
-updates and deletes rows in PostgreSQL so Kafka visibly streams live events —
-exactly like a production system, without you typing SQL all day.
+Traffic simulator
+=================
+Plays the role of a real application: constantly inserts, updates, and deletes
+rows in PostgreSQL so Kafka visibly streams live events without manual SQL.
 
 Usage:
     python3 simulate_traffic.py                 # default: one change every 5s
     python3 simulate_traffic.py --interval 2    # faster
     python3 simulate_traffic.py --duration 300  # stop after 5 minutes
 
-Requires the docker-compose Day 1 stack to be running (cdc-postgres on port 5436).
-Uses ONLY the Python standard library (psycopg not needed) via `docker exec psql`.
+Requires the Docker Compose stack to be running (cdc-postgres on port 5436).
+Uses only the Python standard library via `docker exec psql`.
 """
 import argparse
 import random

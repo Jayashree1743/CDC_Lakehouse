@@ -8,7 +8,7 @@
 -- get_json_object() pulls fields out of the raw kafka_value without needing a
 -- declared schema (Spark parses on read) -> tolerant to source schema drift.
 --
--- TWO LESSONS THAT COST US A BROKEN BUILD (see NOTES.md):
+-- TWO LESSONS THAT COST US A BROKEN BUILD:
 --   1. A DELETE event has after = NULL. Reading only $.after.* made every
 --      deleted contract NULL -> not_null + relationships tests failed.
 --      REPLICA IDENTITY FULL guarantees the BEFORE image on deletes, so we

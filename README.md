@@ -1,207 +1,279 @@
-# Real-Time CDC Lakehouse & Incremental AI Vector Sync
+# Real-Time CDC Lakehouse with Incremental Vector Sync
 
-A production-shaped data platform built in 7 days: it streams every row-level change out of
-PostgreSQL in real time, validates it, models it into a lakehouse, and **incrementally** syncs
-document embeddings into a vector database so a semantic-search API always reflects the latest
-data — with full observability and proven resilience to a broker outage.
+A local, production-shaped data platform that captures PostgreSQL changes, builds a tested Delta lakehouse, and keeps a semantic-search index current without re-embedding the whole corpus.
 
-> **The one-line pitch:** *"I don't rebuild a multi-million-token vector index every night. I
-> re-embed only the chunks that actually changed — estimated at **~95% token savings** — using
-> deterministic chunk IDs and a source-clock watermark."*
+**Postgres → Debezium → Kafka → Spark/Delta → dbt Gold → Qdrant → FastAPI**
+
+---
+
+## Why this exists
+
+Search indexes over changing documents are usually rebuilt on a schedule. That is simple, but expensive: every edit re-embeds the entire corpus.
+
+This project treats the vector index as another downstream consumer of the lakehouse. It:
+
+- captures row-level changes from Postgres through Debezium and Kafka;
+- lands raw events in Bronze, then validates and merges them into Silver;
+- builds tested Gold tables with dbt;
+- re-embeds only the documents that changed;
+- deletes or retires stale vectors when documents are removed or emptied;
+- exposes search, history, and analytics through FastAPI;
+- makes lag, throughput, tokens, and failures visible in Grafana.
+
+The result is a pipeline where an edit costs roughly **1.1% of a full rebuild's embedding work** in the measured 1,000-document benchmark.
+
+---
+
+## At a glance
+
+| Area | Technology |
+|---|---|
+| Source database | PostgreSQL 16 |
+| Change capture | Debezium 3.1 on Kafka Connect |
+| Event log | Apache Kafka 7.6 |
+| Stream processing | Apache Spark 3.5.3 Structured Streaming |
+| Lakehouse storage | Delta Lake 3.2 |
+| Data quality | Great Expectations |
+| Transformations | dbt 1.7.1 + dbt-spark |
+| Embeddings | `fastembed` / `BAAI/bge-small-en-v1.5` (384-d, ONNX) |
+| Vector database | Qdrant 1.12.4 |
+| Lightweight Delta reads | `delta-rs` (`deltalake`) + `pyarrow` |
+| API | FastAPI + Uvicorn + Pydantic |
+| Observability | Prometheus + Grafana |
+| Runtime | Docker Compose, Python 3.11 services |
 
 ---
 
 ## Architecture
 
+```text
+PostgreSQL
+   │  WAL / logical replication
+   ▼
+Debezium + Kafka Connect ──▶ Kafka
+                                │
+                                ▼
+                       Spark Bronze (Delta)
+                                │
+                                ▼
+                       Spark Silver (Delta)
+                         │             │
+                         │             └── bad rows ──▶ DLQ
+                         ▼
+                    dbt Gold (Delta)
+                         │
+                         ▼
+                 vector-sync worker
+              watermark + chunk + embed
+                         │
+                         ▼
+                      Qdrant
+                         │
+                         ▼
+                    FastAPI API
+
+Prometheus ◀── /metrics ── Silver, vector-sync, API
+Grafana    ◀── PromQL ──── Prometheus
 ```
-┌────────────┐  logical    ┌───────────┐   topics   ┌─────────────────────────────────────────┐
-│ PostgreSQL │──replication─▶ Debezium  │───────────▶│                 KAFKA                   │
-│ (source of │   (WAL)      │  Connect  │ inventory.*│  append-only change-event log            │
-│  truth)    │              └───────────┘            └───────────────┬─────────────────────────┘
-└────────────┘                                                      │ (offsets = replay points)
-                                                     ┌──────────────┴──────────────┐
-                                                     ▼                             ▼
-                                          ┌──────────────────┐          ┌──────────────────┐
-                                          │  BRONZE (Spark)  │          │  SILVER (Spark)  │
-                                          │ raw CDC payloads │─────────▶│ parsed + MERGEd  │
-                                          │ append-only Delta│          │ + QUALITY GATE   │
-                                          └──────────────────┘          └────┬─────────┬───┘
-                                                                             │         │
-                                                              good rows ─────┘         └── bad rows ──▶ DLQ
-                                                                                              (Delta + Kafka + metric)
-                    ┌───────────────────────────────┐         ┌──────────────────────────────────────────┐
-                    │  GOLD (dbt on Spark)          │         │  VECTOR-SYNC WORKER (python 3.11)       │
-                    │  dim_customers (dim)          │         │  Silver Delta read via delta-rs (no JVM) │
-                    │  fct_contract_changes         │         │  chunk → embed (fastembed/ONNX, 384-d)   │
-                    │  (incremental, watermark)     │         │  deterministic-ID upsert → QDRANT       │
-                    └──────────────┬────────────────┘         └──────────────────┬─────────────────────┘
-                                   │ Delta-by-path                              │ vectors
-                                   ▼                                            ▼
-                    ┌───────────────────────────────┐         ┌──────────────────────────────────────────┐
-                    │  FASTAPI SERVING (python 3.11)│         │              QDRANT                      │
-                    │  /search  (hybrid: vector +   │◀───────▶│  collection `contracts`, 384-d cosine   │
-                    │   metadata filter + threshold)│          │  deterministic UUID point IDs            │
-                    │  /contracts/{id}/history      │          └──────────────────────────────────────────┘
-                    │  /analytics/changes-per-hour  │
-                    │  /health  /metrics  /docs     │
-                    └──────────────┬────────────────┘
-                                   │ /metrics (Prometheus exposition)
-                                   ▼
-                    ┌───────────────────────────────┐
-                    │  PROMETHEUS ──▶ GRAFANA        │
-                    │  lag/DLQ/token dashboard      │
-                    │  + lag>60s & DLQ alerts       │
-                    └───────────────────────────────┘
-```
+
+Spark writes Delta. The API and the vector worker read the same Delta tables through `delta-rs` — no Spark or JVM in the serving path.
 
 ---
 
-## Tech stack
+## Quick start
 
-| Layer | Technology | Why this one |
-|---|---|---|
-| Source DB | PostgreSQL 16 | Widely used; rich WAL makes log-based CDC clean |
-| CDC | Debezium (Kafka Connect) | Reads the WAL directly — no impact on production queries (vs. trigger/polling) |
-| Streaming log | Apache Kafka | Durable, ordered, replayable log; consumer offsets give exactly-once *effect* |
-| Batch/stream compute | Apache Spark 3.5 + Structured Streaming | Exactly-once Delta writes; foreachBatch enables MERGE & quality gates |
-| Table format | Delta Lake (ACID, time-travel) | Schema enforcement + MERGE + replay = the lakehouse contract |
-| Data quality | Great Expectations | Declarative suites in the Silver gate; failures route to a DLQ, not dropped |
-| Transformation | dbt on Spark | Versioned, tested, incremental models (view vs. incremental materialization) |
-| Vector DB | Qdrant | Payload filters for hybrid search; simple delete-by-filter for stale chunks |
-| Embeddings | fastembed (ONNX, `BAAI/bge-small-en-v1.5`, 384-d) | Local & offline — no API key, no runtime network, deterministic |
-| Delta reader (lightweight) | delta-rs (`deltalake`) | Spark *writes* Delta; a 200 MB service *reads* it with no JVM |
-| Serving | FastAPI + Pydantic | Typed endpoints, free OpenAPI `/docs`, dependency injection |
-| Observability | Prometheus + Grafana (provisioned as code) | Pull model; lag alerting; dashboards are version-controlled |
-
----
-
-## How to run (copy-paste)
-
-**Prerequisites:** Docker + Docker Compose, ~8 GB RAM free, ports `5436, 8083, 9092, 4040, 8000-8002, 6333, 9090, 3000` free.
+**Prerequisites:** Docker Engine with Compose v2, about 8 GB of free RAM, and the ports listed in `docker-compose.yml`.
 
 ```bash
-# 1. Start EVERYTHING (Postgres, ZK, Kafka, Connect, Spark, Qdrant, vector-sync,
-#    API, Prometheus, Grafana) + register connector + start bronze/silver streams
+# Start the stack, register Debezium, start Bronze/Silver, build Gold,
+# start vector sync, API, Prometheus, and Grafana.
 ./run_all.sh
 
-# 2. Check status any time
+# Check containers, connector, and streaming jobs.
 ./run_all.sh --status
 
-# 3. Full end-to-end test (12 assertions, exit code gates CI)
+# End-to-end test: Postgres → Kafka → Bronze → Silver → Gold → Qdrant → API.
 ./e2e_test.sh
 
-# 4. Chaos test: survive a Kafka outage with no data loss
+# Kafka-outage test: make changes while the broker is down, then verify replay.
 ./chaos_test.sh
 
-# 5. Stop everything (keep data) / wipe for a fresh start
+# Stop containers but keep data.
 ./run_all.sh --down
-./run_all.sh --wipe
 ```
 
-**Open the UIs:**
+The first run builds the Spark, API, and vector-sync images. It can take a few minutes while dependencies and the embedding model are downloaded.
+
+### Full reset
+
+```bash
+docker compose -p cdc-lakehouse down -v
+rm -rf lakehouse
+```
+
+The generated `lakehouse/` directory is ignored by git. On Linux, Spark may leave it root-owned; remove it with `sudo` or a root container if necessary.
+
+---
+
+## UIs and endpoints
 
 | URL | What |
 |---|---|
-| http://localhost:8000/docs | Interactive API docs (try requests from the browser) |
-| http://localhost:3000 (admin/admin) | Grafana — "CDC Lakehouse" dashboard |
-| http://localhost:9090 | Prometheus — query metrics, see alert state |
-| http://localhost:6333/dashboard | Qdrant — browse the `contracts` collection |
-| http://localhost:4040 | Spark UI (while a job runs) |
+| http://localhost:8000/docs | FastAPI interactive docs |
+| http://localhost:8000/health | Qdrant and Gold health |
+| http://localhost:3000 | Grafana (`admin` / `admin`) |
+| http://localhost:9090 | Prometheus |
+| http://localhost:6333/dashboard | Qdrant dashboard |
+| http://localhost:4040 | Spark UI while a job is running |
+| http://localhost:8083 | Kafka Connect / Debezium REST API |
 
-**Make a change and watch it flow end-to-end:**
+The API uses a demo key, `demo-key`, for protected endpoints.
+
 ```bash
-docker exec -i cdc-postgres psql -U demo -d inventory \
-  -c "UPDATE contract_documents
-      SET chunk_text='Refunds are processed within 5 business days.',
-          content_hash='manual-1', updated_at=now()
-      WHERE id=4;"
-# within ~15s: Silver merges it, vector-sync re-embeds ONLY that chunk,
-# and a fresh POST /search returns the new wording.
+curl -s http://localhost:8000/search \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: demo-key' \
+  -d '{"query":"refund policy","top_k":5}'
 ```
 
----
-
-## Metrics achieved
-
-> Token counts below are **estimated** with a documented chars÷4 heuristic (both the per-run
-> spend and the full-rebuild baseline use the same basis, so the *ratio* is meaningful even
-> though the absolute numbers are approximations). The **mechanism** — only changed chunks are
-> re-embedded — is directly observable in the logs and Qdrant point counts.
-
-| Metric | Value | Where it's shown |
-|---|---|---|
-| **Incremental token saving (estimated)** | **~95%** — ~41 tokens for one clause change vs ~858 for a full rebuild (chars÷4 estimate) | `vector-sync` log line per run |
-| Chunks re-embedded per update | **exactly 1** (not the whole corpus) | `upserted 1 chunk vectors across 1 document(s)` |
-| Delete propagation | Contract delete → its vectors purged (9 → 5 points) | `purged all vectors for deleted contract_id=2` |
-| Idempotency | Full replay (watermark reset) → point count unchanged (9 → 9), **no duplicates** | deterministic UUID IDs |
-| End-to-end latency | **< 15 s** Postgres → Qdrant (poll interval 10 s + CDC) | `replication_lag_seconds{stage="qdrant"}` |
-| Data-quality gate | Corrupt rows (negative price, bad email) → DLQ, Gold stays clean | GE suites + `dlq_records_total` |
-| E2E integration test | **12 passed, 0 failed** | `./e2e_test.sh` |
-| Chaos test (Kafka outage) | **0 data loss** — missed events replayed after restart | `./chaos_test.sh` |
+| Endpoint | Purpose |
+|---|---|
+| `POST /search` | Semantic search over Qdrant, optional `customer_id` tenant filter |
+| `GET /contracts/{id}/history` | Contract change history from Gold |
+| `GET /analytics/changes-per-hour` | Change counts per hour from Gold |
+| `GET /health` | Qdrant and Gold reachability |
+| `GET /metrics` | Prometheus metrics |
 
 ---
 
-## The four ideas that make the vector sync real (interview-grade)
+## How incremental sync works
 
-1. **Deterministic chunk ID** — `uuid(sha256(document_id ":" chunk_index))`.
-   Same document+position → same ID, forever. This makes **upsert idempotent** (a replay
-   overwrites, never duplicates) and lets us **delete stale chunks without a lookup table**.
-   Random UUIDs break both: you can't know what to delete, and a replay creates ghost duplicates.
+The worker reads Silver `contract_documents` rows after a composite watermark:
 
-2. **Watermark** *(composite)* — the highest *(source commit timestamp, LSN)* successfully
-   synced, persisted **after** each successful run. Next run = "Silver rows `WHERE
-   (source_commit_ts, source_lsn) > watermark`". The LSN tie-break handles two Postgres
-   commits sharing a millisecond (strict `>` on ts alone would drop the second one;
-   `>=` would re-embed the boundary row on every poll). Both fields come from
-   **Postgres's own WAL metadata** (inside the CDC event), not the local wall clock, so
-   machine clock-skew can never drop a row. Written last → a crash re-processes
-   (at-least-once), and deterministic IDs turn that re-run into a harmless overwrite
-   (exactly-once *effect*).
+```text
+(source_commit_ts, source_lsn)
+```
 
-3. **Delete handling** — contract removed → Qdrant delete-by-payload-filter on `contract_id`;
-   a single document removed (while its contract lives) → delete-by-payload-filter on
-   `document_id`; text shortened or emptied → retire the chunk IDs the document no longer owns.
+The timestamp comes from Postgres WAL metadata, not the worker's clock. The LSN breaks ties when two commits share a millisecond. The watermark is persisted after a successful batch, so a crash re-processes the batch safely.
 
-4. **Token math** — every run logs `tokens_embedded` vs `full_corpus_tokens` on a consistent
-   basis, so the ~80 %+ saving is **observable per run**, not a marketing claim (counts are
-   chars÷4 estimates; the ratio is what matters).
+Three details make the index correct:
+
+1. **Deterministic point IDs** — `uuid(sha256(document_id + ":" + chunk_index))`. Replaying a batch overwrites the same point instead of creating a duplicate.
+2. **Purge on delete** — a deleted contract or document removes its vectors by payload filter.
+3. **Retire stale chunks** — if text shrinks or becomes empty, chunk IDs the document no longer owns are removed.
+
+This is why replay is idempotent and why the index does not accumulate ghost vectors.
 
 ---
 
-## Resilience, proven
+## Benchmark snapshot
 
-`./chaos_test.sh` stops Kafka, writes to Postgres **while Kafka is down**, restarts it, and
-asserts the missed changes still arrive. This works because Postgres's WAL is the durable source
-of truth and Kafka consumer offsets let the connector replay exactly what was missed — nothing is
-lost, and the connector + streaming jobs return to `RUNNING` on their own.
+Measured on a live stack with a separate `contracts_bench` collection, worker, and API. The demo collection stayed untouched.
+
+Corpus: **1,000 synthetic contract documents** across 50 contracts and 2 customers, about 133 words per document, **163,726 actual bge tokens**.
+
+| Measure | Result |
+|---|---:|
+| Full rebuild (1,004 vectors) | **33.5 s** compute / **36.6 s** wall |
+| Incremental edit (10 documents) | **0.9 s** worker sync |
+| Commit → search-visible | **17.1 s** median |
+| Tokens per 10-document edit | **1,808** |
+| Full-corpus tokens | **163,726** |
+| Token reduction | **98.9%** |
+| API p95 at c=1 / 10 / 50 | **55.6 / 90.6 / 480.3 ms** |
+| Qdrant p95 at c=1 / 10 / 50 | **1.8 / 17.1 / 17.5 ms** |
+| Tenant-filtered API p95 at c=10 | **394.5 ms** |
+| Delete 10 documents | **23.4 s** to purge |
+| Empty document | **18.3 s** to purge |
+| Replay twice | **993 points**, identical IDs |
+| dbt build | **17 / 17 passed** |
+
+### What the numbers mean
+
+- The **17.1 s** time-to-visible is dominated by the 10 s Spark trigger and polling, not embedding. With the default 10 s poll, expect roughly 25 s.
+- At 50 clients, the API is about **27× slower than Qdrant**. The API embeds the query and performs a tenant-filtered Gold read; Qdrant only retrieves vectors.
+- The bottleneck is the API path — CPU embedding and the Gold lookup — not the vector database.
+
+### Scope
+
+This is a **1,000-document, single-CPU-node, synthetic-data** benchmark. It is a baseline, not a 100k-document or production-scale claim. Search relevance and recall were not evaluated. Results are tied to commit `ed3872f`; rerun the benchmark after changing the pipeline.
 
 ---
 
 ## Project layout
 
-```
-├── docker-compose.yml          # all 10 services
-├── run_all.sh                  # one-command start/status/stop/wipe
-├── e2e_test.sh                 # 12-assertion end-to-end test
-├── chaos_test.sh               # Kafka-outage resilience test
-├── postgres/init.sql           # source schema + REPLICA IDENTITY FULL + seed corpus
-├── connect/                    # Debezium connector config
-├── spark/                      # bronze_job, silver_job, quality.py (GE), metrics.py
-├── dbt/                        # Gold models (staging + marts) + tests + on-run-start hooks
-├── vector_sync/                # worker.py (chunk/embed/upsert/watermark), verify_day4.py
-├── api/                        # FastAPI main.py (search, history, analytics, health)
-├── observability/              # prometheus.yml + alerts.yml + Grafana provisioning
-├── NOTES.md                    # lab notebook: every error + fix (interview story material)
-└── study_plan.md               # 7-day plan + demo checklists + self-tests
+```text
+├── api/                  FastAPI service
+├── connect/              Debezium connector config and registration
+├── dbt/                  Gold models, tests, and source registration
+├── observability/        Prometheus config, alerts, Grafana provisioning
+├── postgres/             Source schema and seed data
+├── spark/                Bronze/Silver jobs, quality gate, metrics, Dockerfile
+├── vector_sync/          Watermark, chunking, embedding, Qdrant sync
+├── docker-compose.yml    Local stack
+├── run_all.sh            Start/status/stop orchestration
+├── e2e_test.sh           End-to-end integration test
+├── chaos_test.sh         Kafka-outage replay test
+├── simulate_traffic.py   Generate live Postgres changes
+├── trace_flow.py         Trace one change through every layer
+├── live_demo.py          Demo script for Grafana panels
+└── README.md
 ```
 
 ---
 
-## Known limitations (honest scope)
+## Known limitations
 
-- Embedding model is **local** (`bge-small-en-v1.5`, 384-d) so the demo runs offline with no API
-  key. Swap `EMBED_MODEL`/the `Embedder` class for OpenAI `text-embedding-3-small` in production.
-- The vector-sync worker polls Silver every 10 s (a deliberate, explainable choice). For lower
-  latency it could read the Silver change stream directly instead.
-- Corpus is small (~9 documents); the **ratio** and **mechanism** are the point, and they scale —
-  the absolute token numbers grow with corpus size but the 95 %+ saving holds.
+- The benchmark uses **1,000 synthetic documents**, not production data.
+- The stack runs on a **single CPU node**; no GPU or multi-node testing.
+- The worker polls every 10 s by default. Lower latency needs event-driven sync or a shorter poll.
+- The local embedding model is `bge-small-en-v1.5`; swapping models changes latency, token counts, and vector dimensions.
+- Search relevance and recall are not measured.
+- Tenant-filtered search performs an uncached Gold read per request.
+- Demo credentials (`admin/admin`, `demo-key`) are local-only and not production security.
+
+---
+
+## Troubleshooting
+
+<details>
+<summary><strong>dbt fails with <code>MessageToJson() got an unexpected keyword argument</code></strong></summary>
+
+The Spark image must use protobuf below version 5. Rebuild it:
+
+```bash
+docker compose -p cdc-lakehouse build spark
+docker compose -p cdc-lakehouse up -d spark
+```
+</details>
+
+<details>
+<summary><strong>dbt fails with <code>DELTA_TABLE_NOT_FOUND</code> for <code>gold.fct_contract_changes</code></strong></summary>
+
+A stale dbt metastore can survive a wipe. Rebuild the incremental Gold model:
+
+```bash
+docker exec cdc-spark bash -c 'cd /dbt && dbt run --select fct_contract_changes --full-refresh'
+```
+</details>
+
+<details>
+<summary><strong>Silver exits on a cold start</strong></summary>
+
+On a fresh volume, Spark may race while downloading Ivy/Maven dependencies. Rerun:
+
+```bash
+./run_all.sh
+```
+</details>
+
+<details>
+<summary><strong><code>./run_all.sh --wipe</code> cannot remove <code>lakehouse/</code></strong></summary>
+
+Spark may have created the directory as root. Use the manual reset:
+
+```bash
+docker compose -p cdc-lakehouse down -v
+sudo rm -rf lakehouse
+```
+</details>
