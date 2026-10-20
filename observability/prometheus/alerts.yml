@@ -1,0 +1,50 @@
+# =============================================================================
+# DAY 6 - PROMETHEUS ALERTING RULES
+# =============================================================================
+# An alert = an expression (PromQL) that stays true for a "for" duration.
+# The classic data-pipeline SLO: end-to-end replication lag must stay low.
+#
+# Replication lag formula (the senior detail):
+#   lag = consumer_processed_at  -  event_source_ts
+# where event_source_ts is the POSTGRES commit timestamp carried INSIDE the CDC
+# event (NOT the local wall clock). Using the source clock means clock skew
+# between machines can never create a fake "negative" or inflated lag.
+
+groups:
+  - name: cdc_lakehouse_alerts
+    rules:
+      # --- REPLICATION LAG (the headline metric) -----------------------------
+      - alert: ReplicationLagHigh
+        # fires if the qdrant-stage lag exceeds 60s continuously for 5 minutes
+        expr: max by (stage) (replication_lag_seconds{stage="qdrant"}) > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Replication lag > 60s for 5 minutes (stage={{ $labels.stage }})"
+          description: >-
+            CDC events are taking more than a minute to reach Qdrant. Check the
+            vector-sync loop, Silver freshness, and the Kafka consumer backlog.
+
+      # --- DLQ DEPTH (bad data piling up = a broken upstream contract) -------
+      - alert: DlqRecordsArriving
+        expr: increase(dlq_records_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} record(s) landed in the DLQ in the last 10 min"
+          description: >-
+            The quality gate is rejecting rows. Gold stays clean, but a source
+            contract was violated - inspect the DLQ Delta table for the reason.
+
+      # --- NO EVENTS SEEN (pipeline stalled?) --------------------------------
+      - alert: CdcPipelineStalled
+        expr: increase(cdc_events_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "No CDC events processed in 10 minutes"
+          description: >-
+            Could be legitimate (no source writes) or a stalled connector /
+            streaming job. Corroborate with the replication-slot + connector status.

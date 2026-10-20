@@ -1,0 +1,76 @@
+# =============================================================================
+# DAY 3 - dbt TESTS  (build task 5)
+# =============================================================================
+# `dbt build` = run models in DAG order + run these tests after each model.
+# A test is just a SQL query that returns the FAILING rows; 0 rows = pass.
+#
+# Built-in tests used here:
+#   unique        - no duplicate keys
+#   not_null      - no NULLs
+#   relationships - every value exists in the referenced model's column (FK check)
+version: 2
+
+models:
+  # ---- staging (views) ----
+  - name: stg_contracts
+    description: >
+      Cleansed current contracts (from Silver). Casts money to decimal.
+      KEEPS soft-deleted rows (is_deleted flag) so event history in
+      fct_contract_changes can still form a valid foreign key to them.
+    columns:
+      - name: contract_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - not_null
+
+  - name: stg_contract_changes
+    description: One row per raw CDC change event parsed from Bronze.
+    columns:
+      - name: change_uid
+        tests:
+          - unique
+          - not_null
+      - name: cdc_op
+        tests:
+          - not_null
+
+  # ---- marts ----
+  - name: dim_customers
+    description: Customer dimension for slicing contract facts.
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+      - name: email
+        tests:
+          - not_null
+
+  - name: fct_contract_changes
+    description: >
+      Incremental fact - one row per contract change event. Answers
+      "how many contract changes per hour today?".
+      NOTE ON POPULATION: this fact is built from BRONZE (raw, pre-validation),
+      while stg_contracts comes from SILVER (post-quality-gate). A row that the
+      Great Expectations gate rejected (parked in the DLQ) therefore HAS change
+      events here but has NO row in Silver/current-state. That is the DLQ
+      working as designed, not a data bug - so we do NOT run a foreign-key test
+      from this fact to stg_contracts. The relationship to dim_customers holds
+      because customers are seeded and never pass through the contract gate.
+    columns:
+      - name: change_uid
+        tests:
+          - unique
+          - not_null
+      - name: contract_id
+        tests:
+          - not_null
+      - name: customer_id
+        tests:
+          # every change must point at a customer that exists in the dim
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id

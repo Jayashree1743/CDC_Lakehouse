@@ -1,0 +1,21 @@
+# =============================================================================
+# DAY 6 - GRAFANA datasource provisioning
+# =============================================================================
+# Grafana is configured AS CODE (declarative), not by clicking through the UI.
+# This file auto-creates the Prometheus data source on boot.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    # PIN the UID so it matches what the dashboard JSON references (uid: prometheus).
+    # Without this, Grafana auto-generates a random UID (e.g. PBFA97CFB590B2093) and
+    # every panel's {datasource: {uid: prometheus}} fails to resolve -> "No data"
+    # on all panels, even though Prometheus has the samples. Fixed by declaring it.
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090     # in-network hostname (compose service name)
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: "5s"            # match Prometheus scrape_interval for clean graphs

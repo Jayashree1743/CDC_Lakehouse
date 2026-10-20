@@ -1,0 +1,11 @@
+# dbt profile: session method = dbt opens a SparkSession IN THIS CONTAINER.
+# Delta support comes from SPARK_CONF_DIR=/opt/spark/conf/spark-defaults.conf (see Dockerfile).
+cdc_gold:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: session
+      schema: gold
+      host: NA
+      organization: NA

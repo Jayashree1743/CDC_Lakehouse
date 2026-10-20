@@ -1,0 +1,123 @@
+{
+  "title": "CDC Lakehouse - Replication Lag & Vector Sync",
+  "uid": "cdc-lakehouse-lag",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Replication lag (Postgres -> Qdrant)",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 30 },
+              { "color": "red", "value": 60 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "replication_lag_seconds{stage=\"qdrant\"}" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Replication lag over time by stage",
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "replication_lag_seconds" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "CDC events processed (by op)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (op) (rate(cdc_events_total[1m]))" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Vector chunks embedded (rate)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (run_type) (rate(vector_chunks_embedded_total[1m]))" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "DLQ records (total)",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "dlq_records_total" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Tokens embedded (incremental vs backfill)",
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (run_type) (rate(vector_tokens_embedded_total[5m]))" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "alertlist",
+      "title": "Active alerts",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "options": {
+        "show": "current",
+        "stateFilter": ["alerting", "pending"],
+        "dashboardFilter": "",
+        "folderFilter": ""
+      }
+    }
+  ]
+}

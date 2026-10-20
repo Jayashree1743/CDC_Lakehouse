@@ -1,0 +1,47 @@
+# =============================================================================
+# DAY 3 - dbt PROJECT: Silver -> Gold
+# =============================================================================
+# dbt turns plain SQL files into a scheduled, tested, documented pipeline.
+# Run:  cd /opt/spark/jobs/dbt && dbt build
+#
+# Vocabulary (interview-grade):
+#   source()  - a reference to data you do NOT own (here: our Silver Delta tables)
+#   ref()     - a reference to ANOTHER dbt model -> builds the dependency graph (DAG)
+#   model     - one .sql file = one table/view in Gold
+#   materialization - HOW dbt builds it: view | table | incremental
+#   test      - a assertion on a model (unique, not_null, relationships)
+# =============================================================================
+name: cdc_gold
+version: "1.0.0"
+config-version: 2
+
+profile: cdc_gold
+
+model-paths: ["models"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  cdc_gold:
+    # staging: light cleaning, 1:1 with source (stays a VIEW - always fresh, cheap)
+    staging:
+      +materialized: view
+    # marts: business-ready tables the BI team / API queries
+    marts:
+      +materialized: table
+
+# Register the Silver/Bronze Delta paths as queryable tables before every run.
+# IMPORTANT: dbt runs EACH list item as a single spark.sql() call, and Spark
+# rejects multiple `;`-separated statements in one call -> one statement per item.
+on-run-start:
+  - "create schema if not exists silver"
+  - "create schema if not exists bronze"
+  - "create table if not exists silver.contracts using delta location '/lakehouse/silver.db/contracts'"
+  - "create table if not exists silver.customers using delta location '/lakehouse/silver.db/customers'"
+  - "create table if not exists silver.contract_documents using delta location '/lakehouse/silver.db/contract_documents'"
+  - "create table if not exists bronze.contracts_cdc using delta location '/lakehouse/bronze.db/contracts_cdc'"
+
+vars:
+  # watermark for the incremental fact model: process events newer than this on
+  # the first run, then dbt tracks it via max(source_commit_ts) already loaded.
+  first_run_ts: 0

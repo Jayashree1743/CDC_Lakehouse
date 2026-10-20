@@ -1,0 +1,15 @@
+# =============================================================================
+# DAY 6 - GRAFANA dashboard provisioning
+# =============================================================================
+# Loads the dashboard JSON below on boot (no manual import needed).
+apiVersion: 1
+
+providers:
+  - name: cdc-lakehouse
+    folder: CDC Lakehouse
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

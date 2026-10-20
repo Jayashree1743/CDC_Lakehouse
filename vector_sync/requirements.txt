@@ -1,0 +1,15 @@
+# ==============================================================================
+# DAY 4 - vector-sync worker dependencies
+# ==============================================================================
+# Runs on Python 3.11 in its OWN container (separate from the Python-3.8 Spark
+# image). This is deliberate: the worker reads the Silver Delta tables with
+# delta-rs (Rust, no JVM) and embeds with fastembed (ONNX, needs py3.9+).
+# Interview point: "Spark WRITES Delta; a lightweight service READS the same
+# Delta tables with a different engine — that is the lakehouse contract."
+
+fastembed            # local ONNX text embeddings (BAAI/bge-small-en-v1.5, 384 dims)
+qdrant-client==1.12.2  # match server v1.12.4 (major equal, minor within 1) -> no version warning
+deltalake            # delta-rs: read Spark-written Delta tables WITHOUT Spark
+pyarrow              # REQUIRED by deltalake for to_pyarrow_table() reads
+prometheus-client    # /metrics for Day 6 scraping
+numpy                # fastembed returns numpy vectors

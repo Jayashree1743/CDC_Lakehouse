@@ -1,0 +1,266 @@
+# =============================================================================
+# DAY 1 STACK: PostgreSQL -> Debezium -> Kafka
+# Project name: cdc-lakehouse  (set via -p so it never clashes with other work)
+#
+# Ports chosen to AVOID conflicts on this machine:
+#   5432 -> busy (local postgres)   5435 -> busy (worktrack)
+#   We use 5436 for our source DB, 9092 for Kafka (host), 8083 for Connect.
+# =============================================================================
+
+name: cdc-lakehouse
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # 1. SOURCE DATABASE - the "production" database we will capture changes from
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine          # already cached locally on this machine
+    container_name: cdc-postgres
+    command:
+      - postgres
+      # ---- CDC REQUIREMENTS (the heart of Day 1) ----
+      # NOTE: "-c" and "name=value" MUST be separate list items.
+      # Writing "- -c wal_level=logical" as one item passes a parameter
+      # literally named " wal_level" (leading space) -> FATAL on boot.
+      - "-c"
+      - wal_level=logical           # tell Postgres to write logical changes to WAL
+      - "-c"
+      - max_replication_slots=4     # room for Debezium's bookmark
+      - "-c"
+      - max_wal_senders=4           # allow replication connections
+      - "-c"
+      - wal_keep_size=256MB         # keep recent WAL so a short connector outage is harmless
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: inventory
+    ports:
+      - "5436:5432"                    # host:5436 -> container:5432
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d inventory"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # ---------------------------------------------------------------------------
+  # 2. ZOOKEEPER - Kafka's coordinator (keeps the lab simple, single broker)
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: cdc-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  # ---------------------------------------------------------------------------
+  # 3. KAFKA BROKER - the event bus that receives every row change
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: cdc-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"                     # host clients (kafka-console-consumer) use this
+      - "29092:29092"                   # in-compose containers use kafka:29092
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners: one for containers, one for your laptop
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single-broker lab settings (NEVER use these in real production)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Keep the demo fast and quiet
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 24
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  # ---------------------------------------------------------------------------
+  # 4. KAFKA CONNECT + DEBEZIUM - reads the WAL and publishes change events
+  # ---------------------------------------------------------------------------
+  connect:
+    image: quay.io/debezium/connect:3.1
+    container_name: cdc-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8083:8083"                     # Debezium REST API lives here
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      REPLICATION_FACTOR: 1
+      LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+
+  # ---------------------------------------------------------------------------
+  # 5. SPARK (Day 2) - reads Kafka CDC events into the Medallion lakehouse
+  #    Bronze (raw) -> Silver (cleansed current state)
+  #    Jobs are submitted by hand:  docker exec cdc-spark /opt/spark/bin/spark-submit ...
+  # ---------------------------------------------------------------------------
+  spark:
+    # Day 3+: custom image = apache/spark + great_expectations + dbt (see spark/Dockerfile)
+    build: ./spark
+    image: cdc-spark:3.5.3
+    container_name: cdc-spark
+    user: root                      # so it can write the mounted ./lakehouse dir
+    entrypoint: ["sleep", "infinity"]
+    ports:
+      - "4040:4040"                 # Spark UI (view while a job runs)
+      - "8001:8001"                 # silver job Prometheus /metrics (Day 6 scrape target)
+    volumes:
+      - ./spark:/jobs               # job scripts
+      - ./dbt:/dbt                  # Day 3: dbt project (Gold models + tests)
+      - ./lakehouse:/lakehouse      # Delta tables + checkpoints live on the host
+      - spark_ivy:/root/.ivy2       # cache of jars downloaded from Maven Central
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 6. QDRANT - the vector database (Day 4). Stores chunk embeddings.
+  # ---------------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: cdc-qdrant
+    ports:
+      - "6333:6333"                 # REST API + /dashboard
+      - "6334:6334"                 # gRPC (unused here, exposed for completeness)
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # 7. VECTOR-SYNC WORKER (Day 4). Reads Silver Delta (delta-rs, NO Spark),
+  #    chunks -> embeds (fastembed / bge-small, 384 dims) -> upserts to Qdrant,
+  #    advances a watermark in silver.db/sync_state.
+  #    Deliberately a SMALL python:3.11 service, NOT the 3.8 Spark image:
+  #    fastembed + delta-rs both want modern Python. Interview point: Spark
+  #    WRITES Delta, a lightweight service READS it with a different engine.
+  # ---------------------------------------------------------------------------
+  vector-sync:
+    build: ./vector_sync
+    container_name: cdc-vector-sync
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      LAKEHOUSE: /lakehouse
+      QDRANT_COLLECTION: contracts
+      EMBED_MODEL: BAAI/bge-small-en-v1.5
+      METRICS_PORT: "8002"
+      POLL_SECONDS: "10"
+    ports:
+      - "8002:8002"                 # Prometheus /metrics (Day 6 scrape target)
+    # loop mode: watermark=0 on first run -> natural full backfill, then it keeps
+    # polling Silver every POLL_SECONDS and syncs only what changed.
+    command: ["python3", "/worker.py", "--mode", "loop"]
+    volumes:
+      - ./lakehouse:/lakehouse      # reads Silver, writes sync_state watermark
+      # Bind-mount the worker for FAST iteration (edit -> restart container, no
+      # rebuild). In a real deploy you'd bake it into the image instead.
+      - ./vector_sync/worker.py:/worker.py
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      spark:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # 8. API (Day 5) - FastAPI over Qdrant (semantic search) + Gold Delta (analytics).
+  #    Reads Gold by PATH with delta-rs (no Spark/JVM) -> lightweight + fast.
+  # ---------------------------------------------------------------------------
+  api:
+    build: ./api
+    container_name: cdc-api
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      LAKEHOUSE: /lakehouse
+      QDRANT_COLLECTION: contracts
+      EMBED_MODEL: BAAI/bge-small-en-v1.5
+      API_KEY: demo-key
+    ports:
+      - "8000:8000"                 # /docs, /search, /health, ...
+    volumes:
+      - ./lakehouse:/lakehouse      # reads Gold fct_contract_changes
+      # Bind-mount for FAST iteration (edit -> restart, no rebuild).
+      - ./api/main.py:/app/main.py
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      vector-sync:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # 9. PROMETHEUS (Day 6) - scrapes each service's /metrics every 5s.
+  #    host.docker.internal reaches the HOST, where the job/api metrics servers
+  #    (8001/8002/8000) are published. extra_hosts maps that name on Linux.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: cdc-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=6h"     # short retention: it's a lab
+      - "--web.enable-lifecycle"               # allow /-/reload
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"    # Linux needs this; Docker Desktop has it
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prom_data:/prometheus
+
+  # ---------------------------------------------------------------------------
+  # 10. GRAFANA (Day 6) - replication-lag dashboard, provisioned AS CODE.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: cdc-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"        # so /docs+dashboards are viewable in the lab
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - graf_data:/var/lib/grafana
+
+volumes:
+  pgdata:
+  spark_ivy:
+  qdrant_data:
+  prom_data:
+  graf_data:

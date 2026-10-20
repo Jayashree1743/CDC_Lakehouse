@@ -1,0 +1,25 @@
+# =============================================================================
+# DAY 3 - dbt SOURCES: the raw Silver/Bronze Delta tables dbt reads from.
+# =============================================================================
+# `source()` = "data I do not own / did not build in dbt" -> gives lineage.
+# The actual Delta paths are registered as external tables by the on-run-start
+# hooks in dbt_project.yml (see create_sources() macro), because our Silver and
+# Bronze tables are written by Spark as plain Delta paths, not metastore tables.
+version: 2
+
+sources:
+  - name: silver
+    description: Cleansed current-state tables produced by the Silver streaming job.
+    tables:
+      - name: contracts
+        description: One current row per contract (SCD Type-1 upsert).
+      - name: customers
+        description: One current row per customer.
+      - name: contract_documents
+        description: Text chunks that the Day-4 worker embeds into Qdrant.
+
+  - name: bronze
+    description: Append-only raw CDC event log (every change, replayable).
+    tables:
+      - name: contracts_cdc
+        description: Raw Debezium envelope JSON for every contracts change.
