@@ -724,3 +724,122 @@ t+25s      18            5  <- +1      20.1 <- drop   worker embedded the chunk,
    > offsets, causing dedup to discard NEW data that collides with OLD. The right key is the
    > Postgres LSN (monotonic WAL position) combined with the primary key: LSN survives restarts,
    > and the PK keeps initial-snapshot rows distinct because they all share one LSN.
+
+---
+
+# Post-Portfolio Audit Session (Tier 1 + Tier 2 hardening)
+
+An external audit reviewed the project after Day 7. We verified every claim
+against the code (all were accurate), then fixed Tier 1 + Tier 2. This section
+is the errors+fixes record for that session.
+
+## TIER 1 — repo hygiene & privacy
+
+### Fix 1: PII was committed to a PUBLIC GitHub repo (highest severity)
+- **Found:** `build_resume.py` (phone, email, LinkedIn, GitHub handle) + 2 resume
+  PDFs were tracked, and the repo `Jayashree1743/CDC_Lakehouse` is **public**.
+  The single commit held them, so `git rm` alone was NOT enough — the objects
+  lived in history.
+- **Fix (in order):**
+  1. Moved resume files out of the repo to `~/private_resume/`.
+  2. Deleted `__pycache__/build_resume.cpython-312.pyc` — a *compiled* file that
+     still embedded the phone number on disk after the source was gone. Lesson:
+     **grep -r after deleting sources; bytecode caches hold string literals.**
+  3. Added `.gitignore` (lakehouse/, dbt target/logs/metastore, __pycache__,
+     *.pdf, .vscode/) and untracked 886 junk files.
+  4. **History rewrite**: repo had exactly 1 commit, so we made a fresh orphan
+     root commit with the clean tree, force-pushed over `main`.
+  5. Changed commit author/committer email to `Jayashree1743@users.noreply.github.com`
+     — the *metadata* itself carried the personal gmail (`git log --format='%ae'`
+     to check this; most people forget it).
+- **The hidden keep-alive:** after the rewrite, `git rev-list --all` STILL
+  returned the old PII commit even though `show-ref` showed one ref. Cause: a
+  **linked worktree** (`~/.local/share/kilo/worktree-pool/...`) left by another
+  tool held a *detached HEAD* at the old commit. Every ref — including detached
+  HEADs — keeps objects alive. `git worktree list` was the detector.
+- **Verified:** remote history grep = clean, no PII filenames in remote tree,
+  emails in metadata = noreply only, objects purged (938 → 69).
+- **Interview quote:** *"Purging PII from a public repo isn't `git rm` — you need
+  to rewrite history, fix the committer metadata, and hunt down every ref that
+  pins the old objects. In my case a detached worktree was silently keeping the
+  old commit reachable."*
+
+### Fix 2: `dbt build` never ran in the automation
+- **Found:** `run_all.sh` had zero dbt mentions. Fresh clone → Gold tables never
+  built → `/analytics/*` = 503, e2e would fail 2 assertions. It "worked" only
+  because a stale committed `gold.db` existed.
+- **Fix:** new step **5/7 "Gold (dbt build)"** in run_all.sh — runs
+  `docker exec cdc-spark bash -c 'cd /dbt && dbt build --profiles-dir /root/.dbt'`
+  (dbt runs INSIDE the spark container, session method).
+- **Verified:** full `./run_all.sh` now prints `OK dbt build passed`.
+
+## TIER 2 — correctness
+
+### Fix 3: dbt was broken on the checked-in data (3 latent failures)
+| # | Cause | Fix |
+|---|---|---|
+| a | `stg_contract_changes` read only `$.after.*` → DELETE events had `contract_id = NULL`, failing not_null/relationships | `coalesce($.after.x, $.before.x)` for every column (REPLICA IDENTITY FULL guarantees the before-image) |
+| b | `change_uid = concat(partition,'-',offset)` — the *same offset-reuse bug Silver had fixed*; duplicate offsets broke `unique` | `change_uid = concat(contract_id, '-', source_lsn)` + `row_number()` dedup (at-least-once replays collapse) |
+| c | `fct` (built from Bronze) keeps history for DLQ-rejected/soft-deleted contracts, but `stg_contracts` filtered `is_deleted=false` → relationships test failed on *correct* data | `stg_contracts` now keeps soft-deleted rows (flag exposed); removed the fct→stg FK test with a written rationale: **Bronze-sourced fact and Silver-sourced dimension deliberately have different populations — that's the quality gate working, not a data bug.** |
+- **Also found & fixed (not in audit):** the Spark image's `protobuf<5` pin was
+  in the *same pip command* as its dependencies → pip's resolver silently
+  upgraded protobuf to 5.29.6 → `dbt` crashed with `MessageToJson() got an
+  unexpected keyword argument 'including_default_value_fields'`. Fixed by a
+  **separate final `pip install --force-reinstall "protobuf<5"` step** in the
+  Dockerfile. (Only surfaced because we ran dbt from a *dropped* gold.db — the
+  stale committed artifacts had been masking a broken toolchain.)
+- **Verified:** dropped gold.db + metastore tables, rebuilt from scratch:
+  `PASS=17 ERROR=0`.
+
+### Fix 4: document-level vector leak (2.1) — delete handling was incomplete
+- **Found:** deleted `contract_documents` rows were skipped by the worker and
+  only *contracts* got purged → a document deleted while its contract lived
+  kept its vectors in Qdrant **forever**. Same hole when a doc's text became
+  empty (0 chunks → never registered → stale tail never retired).
+- **Fix:** `sync_documents` now (a) deletes-by-payload `document_id` for every
+  soft-deleted doc, (b) registers **every** processed doc in `doc_chunk_counts`
+  *before* retirement — including 0-chunk ones.
+- **Live proof:** hard-deleted doc id=1 (contract 1 alive) → Qdrant count for
+  document_id=1 went 1 → 0 in ~27 s; sibling docs 4/5/6/7 untouched (scoped
+  delete, not a nuke).
+
+### Fix 5: watermark — first `>=`, then the real answer (composite ts+lsn)
+- **Mistake we caught ourselves:** audit suggested `>=`. We implemented it, then
+  the logs showed the **regression**: watermark stuck, every poll re-embedded
+  the boundary row (~27 tokens/run forever, "no-op" never reached). Idempotent
+  but infinitely wasteful.
+- **Fix (the audit's own better option):** composite watermark
+  `(source_commit_ts, source_lsn)` with **strictly greater** comparison:
+  - LSN tie-break → two commits sharing a Postgres ms are both processed
+  - strict `>` on the pair → boundary row not re-read, no re-embed loop
+  - `sync_state` gained a `watermark_lsn` column via
+    `write_deltalake(..., schema_mode="merge")` so old 5-column state files
+    still read (missing lsn → 0).
+- **Verified:** steady state logs `nothing changed since watermark -> no-op`
+  (0 tokens); a new change still visible in semantic search in 3 s.
+
+### Fix 6: Silver latest-per-key tie-break used the untrusted key (2.5)
+- `Window.orderBy(source_ts_ms, kafka_offset)` — kafka_offset is the key we
+  *proved* is reusable across restarts. Changed to `source_lsn`
+  (monotonic WAL position). Dead duplicate `whenMatchedUpdateAll(condition=
+  cdc_op='d')` branch removed with a comment explaining why one branch suffices.
+
+### Fix 7: chaos test could never fail CI (3.3)
+- Printed PASS/FAIL but always exited 0. Added `FAILURES` counter in `fail()`,
+  terminal `exit 1` if >0, `exit 0` otherwise. **Verified both paths** by
+  sourcing the real exit block with FAILURES=0/1.
+
+### Fix 8: README overclaims (2.7)
+- "95.2% measured" → "~95% estimated (chars÷4 heuristic)" with an explicit
+  note that the *mechanism* (only changed chunks re-embedded) is the observable
+  fact; the denominator now counts LIVE docs only (was inconsistent between
+  backfill and sync). Token math described as estimated everywhere.
+
+## Test results after Tier 1 + Tier 2
+- `./run_all.sh` — all 7 steps OK (incl. new dbt step)
+- `dbt build` from dropped gold — **PASS=17 ERROR=0**
+- `./e2e_test.sh` — **12 passed, 0 failed**
+- `./chaos_test.sh` — all PASS, exit 0 (and provably exit 1 on failure)
+- document-delete purge — live-verified (1 → 0 vectors, siblings intact)
+- composite watermark — no-op at steady state + 3 s change propagation
+- remote repo — no PII in tree, history, or commit metadata
