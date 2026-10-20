@@ -4,6 +4,8 @@ A local, production-shaped data platform that captures PostgreSQL changes, build
 
 **Postgres → Debezium → Kafka → Spark/Delta → dbt Gold → Qdrant → FastAPI**
 
+**▶ [Watch the end-to-end demo](https://drive.google.com/file/d/1Mg9T2JGi6JTg-7qEYEjoyThdpLVWl3MG/view?usp=sharing)**
+
 ---
 
 ## Why this exists
