@@ -30,6 +30,96 @@ vector_sync_running() {
     'tr "\000" " " </proc/1/cmdline 2>/dev/null | grep -F worker.py >/dev/null' 2>/dev/null
 }
 
+# Spark writes ./lakehouse and dbt's Derby metastore as root. A plain host
+# `rm -rf` can therefore fail with "Permission denied". Remove them from a
+# throwaway root container instead.
+remove_path_as_root() {
+  local path="$1"
+  docker run --rm -v "$PWD:/work" alpine:3 \
+    sh -c "rm -rf '/work/$path'" >/dev/null 2>&1 || true
+}
+
+clean_lakehouse() {
+  if [ -e lakehouse ]; then
+    log "removing generated lakehouse data ..."
+    remove_path_as_root "lakehouse"
+    ok "lakehouse removed"
+  fi
+}
+
+clean_dbt_state() {
+  if [ -e dbt/metastore_db ] || [ -e dbt/derby.log ]; then
+    log "clearing stale dbt metastore ..."
+    remove_path_as_root "dbt/metastore_db"
+    remove_path_as_root "dbt/derby.log"
+    ok "dbt state cleared"
+  fi
+}
+
+# Keep the Derby metastore and the Delta Gold location in sync. If one was
+# deleted without the other, dbt either sees dangling table metadata
+# (DELTA_TABLE_NOT_FOUND) or refuses to recreate a table whose location exists
+# (LOCATION_ALREADY_EXISTS). Rebuild the missing side rather than guessing.
+prepare_dbt_state() {
+  local has_meta=0 has_gold=0
+  [ -e dbt/metastore_db ] && has_meta=1
+  [ -e lakehouse/gold.db ] && has_gold=1
+
+  if [ "$has_meta" = "1" ] && [ "$has_gold" = "0" ]; then
+    log "dbt metastore exists but Gold data is missing; clearing metastore ..."
+    remove_path_as_root "dbt/metastore_db"
+    remove_path_as_root "dbt/derby.log"
+    ok "dbt metastore cleared"
+  elif [ "$has_meta" = "0" ] && [ "$has_gold" = "1" ]; then
+    log "Gold data exists but dbt metastore is missing; rebuilding Gold ..."
+    remove_path_as_root "lakehouse/gold.db"
+    ok "orphaned Gold data cleared"
+  fi
+}
+
+# On a fresh `spark_ivy` volume, Bronze and Silver both try to download the
+# same Maven jars. Serialize that cold-start download instead of racing.
+wait_for_ivy() {
+  log "waiting for Spark Ivy dependencies ..."
+  for _ in $(seq 1 60); do
+    if docker exec cdc-spark sh -c \
+      'ls /root/.ivy2/jars 2>/dev/null | grep -q "delta-spark" && \
+       ls /root/.ivy2/jars 2>/dev/null | grep -q "spark-sql-kafka"'; then
+      ok "Ivy dependencies cached"
+      return 0
+    fi
+    sleep 3
+  done
+  warn "Ivy dependency wait timed out; starting Silver anyway"
+}
+
+# dbt registers silver.* as external Delta tables. If it does that while
+# Silver's first microbatch is still creating those tables, dbt can win the
+# race and create an empty table with no columns. Wait for Silver to finish its
+# initial batch before running dbt.
+wait_for_silver() {
+  log "waiting for Silver to process its initial batch ..."
+  for _ in $(seq 1 60); do
+    if docker exec cdc-spark grep -q "Streaming query has been idle" \
+        /tmp/silver_job.log 2>/dev/null; then
+      ok "Silver initial batch processed"
+      return 0
+    fi
+    if ! running "silver_job.py"; then
+      warn "Silver stopped before its initial batch completed"
+      return 1
+    fi
+    if docker exec cdc-spark grep -q "StreamingQueryException" \
+        /tmp/silver_job.log 2>/dev/null; then
+      warn "Silver hit a StreamingQueryException"
+      return 1
+    fi
+    sleep 3
+  done
+  warn "Silver initial batch not confirmed after 180s"
+  return 1
+}
+
 # Qdrant v1.12 answers GET /collections with  {"result":{"collections":[...]}}
 # (a dict). Older builds returned a bare list. Handle both shapes.
 qdrant_collections() {
@@ -88,7 +178,7 @@ case "${1:-}" in
   --status) status; exit 0 ;;
   --stop)   stop_jobs; exit 0 ;;
   --down)   stop_jobs; log "stopping containers (data KEPT)"; docker compose -p "$PROJECT" down; exit 0 ;;
-  --wipe)   stop_jobs; log "stopping containers and DELETING all data"; docker compose -p "$PROJECT" down -v; rm -rf lakehouse; exit 0 ;;
+  --wipe)   stop_jobs; log "stopping containers and DELETING all data"; docker compose -p "$PROJECT" down -v; clean_lakehouse; clean_dbt_state; exit 0 ;;
   "")       ;;   # fall through to start
   *)        echo "usage: $0 [--status|--stop|--down|--wipe]"; exit 1 ;;
 esac
@@ -127,19 +217,44 @@ fi
 log "4/7 Spark streaming jobs ..."
 start_job "bronze (Kafka -> raw Delta)"  "bronze_job.py" \
   "io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3"
+wait_for_ivy
+start_job "bronze (Kafka -> raw Delta)"  "bronze_job.py" \
+  "io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3"
 start_job "silver (validate -> MERGE/DLQ)"  "silver_job.py"  \
   "io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3"
+if ! wait_for_silver; then
+  warn "restarting Silver once ..."
+  start_job "silver (validate -> MERGE/DLQ)"  "silver_job.py"  \
+    "io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3"
+  wait_for_silver || true
+fi
 
 # --- 5. Gold (dbt) ------------------------------------------------------------
 # dbt runs INSIDE the spark container (session method -> its own SparkSession).
 # This is what actually BUILDS the Gold tables the API's /analytics endpoints
 # read. Without this step a fresh clone returns 503 on those endpoints.
 log "5/7 Gold (dbt build) ..."
-if docker exec cdc-spark bash -c 'cd /dbt && dbt build --profiles-dir /root/.dbt' \
-     > /tmp/dbt_build.log 2>&1; then
+prepare_dbt_state
+run_dbt_build() {
+  docker exec cdc-spark bash -c 'cd /dbt && dbt build --profiles-dir /root/.dbt' \
+    >> /tmp/dbt_build.log 2>&1
+}
+: > /tmp/dbt_build.log
+if run_dbt_build; then
   ok "dbt build passed (models + tests)"
 else
-  warn "dbt build FAILED - run: docker exec cdc-spark cat /tmp/dbt_build.log"
+  # A partial prior run can leave both the Derby metastore and the Gold
+  # directory present but out of sync. One clean rebuild is deterministic and
+  # avoids making the user debug dbt on every cold start.
+  warn "dbt build failed - retrying with a clean metastore + Gold location ..."
+  remove_path_as_root "dbt/metastore_db"
+  remove_path_as_root "dbt/derby.log"
+  remove_path_as_root "lakehouse/gold.db"
+  if run_dbt_build; then
+    ok "dbt build passed after repair (models + tests)"
+  else
+    warn "dbt build FAILED - check /tmp/dbt_build.log on the host"
+  fi
 fi
 
 # --- 6. vector sync (Day 4) --------------------------------------------------

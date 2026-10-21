@@ -109,11 +109,10 @@ The first run builds the Spark, API, and vector-sync images. It can take a few m
 ### Full reset
 
 ```bash
-docker compose -p cdc-lakehouse down -v
-rm -rf lakehouse
+./run_all.sh --wipe
 ```
 
-The generated `lakehouse/` directory is ignored by git. On Linux, Spark may leave it root-owned; remove it with `sudo` or a root container if necessary.
+This removes containers, volumes, the generated `lakehouse/` directory, and stale dbt state. The reset uses a throwaway root container for files Spark may have created as root, so it works from a normal user shell.
 
 ---
 
@@ -198,7 +197,38 @@ Corpus: **1,000 synthetic contract documents** across 50 contracts and 2 custome
 
 ### Scope
 
-This is a **1,000-document, single-CPU-node, synthetic-data** benchmark. It is a baseline, not a 100k-document or production-scale claim. Search relevance and recall were not evaluated. Results are tied to commit `ed3872f`; rerun the benchmark after changing the pipeline.
+This is a **1,000-document, single-CPU-node, synthetic-data** benchmark. It is a baseline, not a 100k-document or production-scale claim. Results are tied to commit `ed3872f`; rerun the benchmark after changing the pipeline.
+
+---
+
+## Retrieval evaluation
+
+Latency is only half the story. `eval/` contains a labelled starter set and a
+small harness that measures document-level **Recall@k**, **Precision@k**,
+**MRR@k**, and **nDCG@k** against the live `/search` endpoint.
+
+```bash
+# Vector-only baseline (standard library only)
+python3 eval/evaluate.py
+
+# Optional cross-encoder reranking inside the API image
+docker run --rm --network host \
+  -v "$PWD:/work" -v "$HOME/.cache/huggingface:/models" \
+  -w /work --entrypoint python cdc-lakehouse-api:latest \
+  eval/evaluate.py --rerank
+```
+
+Current starter set: **24 queries over the 8 demo documents**.
+
+| Mode | Recall@5 | Precision@5 | MRR@5 | nDCG@5 |
+|---|---:|---:|---:|---:|
+| Vector-only (`bge-small-en-v1.5`) | 1.000 | 0.200 | 0.931 | 0.948 |
+| + `jina-reranker-v1-turbo-en` | 1.000 | 0.200 | 0.979 | 0.985 |
+
+Precision@5 is capped at 0.2 because each query has one relevant document. This
+starter set checks ranking and label quality; it is **not** a corpus-scale
+relevance study. See [`eval/README.md`](eval/README.md) for usage and how to add
+queries.
 
 ---
 
@@ -208,6 +238,7 @@ This is a **1,000-document, single-CPU-node, synthetic-data** benchmark. It is a
 ├── api/                  FastAPI service
 ├── connect/              Debezium connector config and registration
 ├── dbt/                  Gold models, tests, and source registration
+├── eval/                 Labelled retrieval queries + ranking metrics
 ├── observability/        Prometheus config, alerts, Grafana provisioning
 ├── postgres/             Source schema and seed data
 ├── spark/                Bronze/Silver jobs, quality gate, metrics, Dockerfile
@@ -230,7 +261,7 @@ This is a **1,000-document, single-CPU-node, synthetic-data** benchmark. It is a
 - The stack runs on a **single CPU node**; no GPU or multi-node testing.
 - The worker polls every 10 s by default. Lower latency needs event-driven sync or a shorter poll.
 - The local embedding model is `bge-small-en-v1.5`; swapping models changes latency, token counts, and vector dimensions.
-- Search relevance and recall are not measured.
+- Retrieval quality is measured on a 24-query starter set over 8 demo documents, not a production relevance corpus.
 - Tenant-filtered search performs an uncached Gold read per request.
 - Demo credentials (`admin/admin`, `demo-key`) are local-only and not production security.
 
@@ -252,7 +283,7 @@ docker compose -p cdc-lakehouse up -d spark
 <details>
 <summary><strong>dbt fails with <code>DELTA_TABLE_NOT_FOUND</code> for <code>gold.fct_contract_changes</code></strong></summary>
 
-A stale dbt metastore can survive a wipe. Rebuild the incremental Gold model:
+A stale dbt metastore can survive a partial reset. Rebuild the incremental Gold model:
 
 ```bash
 docker exec cdc-spark bash -c 'cd /dbt && dbt run --select fct_contract_changes --full-refresh'
@@ -262,7 +293,7 @@ docker exec cdc-spark bash -c 'cd /dbt && dbt run --select fct_contract_changes 
 <details>
 <summary><strong>Silver exits on a cold start</strong></summary>
 
-On a fresh volume, Spark may race while downloading Ivy/Maven dependencies. Rerun:
+On a fresh volume, Spark may race while downloading Ivy/Maven dependencies. The startup script waits for the shared cache, but if Bronze or Silver still exits, run:
 
 ```bash
 ./run_all.sh
@@ -270,12 +301,11 @@ On a fresh volume, Spark may race while downloading Ivy/Maven dependencies. Reru
 </details>
 
 <details>
-<summary><strong><code>./run_all.sh --wipe</code> cannot remove <code>lakehouse/</code></strong></summary>
+<summary><strong>dbt build failed</strong></summary>
 
-Spark may have created the directory as root. Use the manual reset:
+The dbt log is written on the **host** at `/tmp/dbt_build.log`:
 
 ```bash
-docker compose -p cdc-lakehouse down -v
-sudo rm -rf lakehouse
+tail -100 /tmp/dbt_build.log
 ```
 </details>

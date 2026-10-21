@@ -1,0 +1,24 @@
+{"query": "What response time applies to a severity-one outage?", "relevant_document_ids": ["1"]}
+{"query": "What does Premium Support include for critical incidents?", "relevant_document_ids": ["1"]}
+{"query": "How quickly must the vendor respond when production is down?", "relevant_document_ids": ["1"]}
+{"query": "When does the Acme contract automatically renew?", "relevant_document_ids": ["2"]}
+{"query": "What is the maximum annual price increase at renewal?", "relevant_document_ids": ["2"]}
+{"query": "How much notice is required to stop an automatic renewal?", "relevant_document_ids": ["2"]}
+{"query": "Can either party terminate the agreement for a material breach?", "relevant_document_ids": ["3"]}
+{"query": "What happens to prepaid fees after termination for cause?", "relevant_document_ids": ["3"]}
+{"query": "What events allow immediate termination?", "relevant_document_ids": ["3"]}
+{"query": "What are the payment terms for invoices?", "relevant_document_ids": ["4"]}
+{"query": "What interest is charged on late payments?", "relevant_document_ids": ["4"]}
+{"query": "Who pays the cost of collecting overdue amounts?", "relevant_document_ids": ["4"]}
+{"query": "What features are included in Basic Analytics?", "relevant_document_ids": ["5"]}
+{"query": "How many named user seats does Zenith receive?", "relevant_document_ids": ["5"]}
+{"query": "What support is available during business hours?", "relevant_document_ids": ["5"]}
+{"query": "How is Zenith Health data protected?", "relevant_document_ids": ["6"]}
+{"query": "How quickly must a data breach be reported?", "relevant_document_ids": ["6"]}
+{"query": "Is there a HIPAA business associate agreement?", "relevant_document_ids": ["6"]}
+{"query": "Can Zenith terminate the agreement for convenience?", "relevant_document_ids": ["7"]}
+{"query": "What is the cap on each party's liability?", "relevant_document_ids": ["7"]}
+{"query": "Are indirect or consequential damages excluded?", "relevant_document_ids": ["7"]}
+{"query": "What happens to customer data after the agreement ends?", "relevant_document_ids": ["8"]}
+{"query": "How quickly must the vendor delete customer data after termination?", "relevant_document_ids": ["8"]}
+{"query": "Can the vendor use customer data for purposes outside the service?", "relevant_document_ids": ["8"]}
