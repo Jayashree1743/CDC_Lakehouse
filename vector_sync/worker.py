@@ -84,10 +84,17 @@ COLLECTION = os.environ.get("QDRANT_COLLECTION", "contracts")
 MODEL_NAME = os.environ.get("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "8002"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))
+# A single 10k-point upsert can exceed httpx's default 5s write timeout. Keep
+# requests bounded and give Qdrant enough time to acknowledge each batch.
+UPSERT_BATCH = int(os.environ.get("UPSERT_BATCH", "256"))
+QDRANT_TIMEOUT = float(os.environ.get("QDRANT_TIMEOUT", "60"))
 
 SILVER_DOCS = f"{LAKEHOUSE}/silver.db/contract_documents"
 SILVER_CONTRACTS = f"{LAKEHOUSE}/silver.db/contracts"
-SYNC_STATE = f"{LAKEHOUSE}/silver.db/sync_state"
+# The default keeps the production/demo worker unchanged. Benchmarks and
+# rebuild experiments can point at their own watermark so they never advance
+# the demo worker's position.
+SYNC_STATE = os.environ.get("SYNC_STATE_PATH", f"{LAKEHOUSE}/silver.db/sync_state")
 
 # Chunking knobs: the splitter is WORD-based (split on whitespace, rejoin) --
 # these are WORD counts, NOT characters. 300 words ~= 400 tokens, deliberately
@@ -205,7 +212,7 @@ class Embedder:
 # 3. Qdrant collection management                                              #
 # --------------------------------------------------------------------------- #
 def get_qdrant():
-    return QdrantClient(url=QDRANT_URL)
+    return QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT)
 
 
 def ensure_collection(qdrant, dim):
@@ -319,11 +326,13 @@ def deleted_contracts(since_wm):
 # --------------------------------------------------------------------------- #
 # 6. The actual sync                                                           #
 # --------------------------------------------------------------------------- #
-def sync_documents(qdrant, embedder, docs, run_type):
+def sync_documents(qdrant, embedder, docs, run_type, retire_stale=True):
     """Chunk -> embed -> upsert -> retire stale tail chunks. Returns token spend.
 
     `docs` may contain soft-deleted rows and rows whose text is now empty.
     Both MUST still be tracked so their old vectors get retired (see below).
+    A full backfill into a fresh collection can skip the per-document stale-ID
+    lookups; incremental sync must keep them.
     """
     to_embed, plan, doc_chunk_counts = [], [], {}
     for d in docs:
@@ -370,26 +379,35 @@ def sync_documents(qdrant, embedder, docs, run_type):
             ))
 
         # --- UPSERT (idempotent: same deterministic IDs -> overwrite, no dupes)
-        qdrant.upsert(collection_name=COLLECTION, points=points, wait=True)
+        # Batch the request. Putting 10k points in one HTTP body can exceed the
+        # client write timeout even when Qdrant eventually accepts it.
+        for start in range(0, len(points), UPSERT_BATCH):
+            qdrant.upsert(
+                collection_name=COLLECTION,
+                points=points[start:start + UPSERT_BATCH],
+                wait=True,
+            )
         CHUNKS_EMBEDDED.labels(run_type=run_type).inc(len(points))
         TOKENS_EMBEDDED.labels(run_type=run_type).inc(tokens)
         DOCS_SYNCED.inc(len(doc_chunk_counts))
         log(f"upserted {len(points)} chunk vectors across "
-            f"{len(doc_chunk_counts)} document(s), ~{tokens} tokens")
+            f"{len(doc_chunk_counts)} document(s), ~{tokens} tokens "
+            f"in {(len(points) + UPSERT_BATCH - 1) // UPSERT_BATCH} batch(es)")
 
     # --- RETIRE stale chunks (text shrank, emptied, or doc was deleted) -------
     # doc_chunk_counts knows how many chunks each processed doc OWNS now
     # (0 for deleted/emptied). Any deterministic ID beyond that count still in
     # Qdrant is stale and gets deleted.
     retired = 0
-    for doc_id, count_now in doc_chunk_counts.items():
-        stale_ids = [chunk_id(doc_id, i) for i in range(count_now, count_now + 50)]
-        res = qdrant.retrieve(collection_name=COLLECTION, ids=stale_ids)
-        real_stale = [p.id for p in res]
-        if real_stale:
-            qdrant.delete(collection_name=COLLECTION,
-                          points_selector=real_stale, wait=True)
-            retired += len(real_stale)
+    if retire_stale:
+        for doc_id, count_now in doc_chunk_counts.items():
+            stale_ids = [chunk_id(doc_id, i) for i in range(count_now, count_now + 50)]
+            res = qdrant.retrieve(collection_name=COLLECTION, ids=stale_ids)
+            real_stale = [p.id for p in res]
+            if real_stale:
+                qdrant.delete(collection_name=COLLECTION,
+                              points_selector=real_stale, wait=True)
+                retired += len(real_stale)
     if retired:
         VECTORS_DELETED.inc(retired)
         log(f"retired {retired} stale tail chunk(s)")
@@ -413,7 +431,9 @@ def run_backfill(qdrant, embedder):
     t0 = time.time()
     _, all_rows = changed_docs((0, 0))
     live = [r for r in all_rows if not r.get("is_deleted")]
-    tokens = sync_documents(qdrant, embedder, live, "backfill")
+    # A backfill normally targets a fresh collection; skipping 50 stale-ID
+    # probes per document keeps a 10k rebuild from making 10k extra HTTP calls.
+    tokens = sync_documents(qdrant, embedder, live, "backfill", retire_stale=False)
     # full-rebuild cost basis for the 80% comparison line
     full = sum(max(1, len(r.get("chunk_text", "")) // CHARS_PER_TOKEN) for r in live)
     # composite watermark = max (ts, lsn) over every row we just handled

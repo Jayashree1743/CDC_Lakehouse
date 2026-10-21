@@ -195,9 +195,36 @@ Corpus: **1,000 synthetic contract documents** across 50 contracts and 2 custome
 - At 50 clients, the API is about **27× slower than Qdrant**. The API embeds the query and performs a tenant-filtered Gold read; Qdrant only retrieves vectors.
 - The bottleneck is the API path — CPU embedding and the Gold lookup — not the vector database.
 
+### Scale check (10,000 documents)
+
+A separate run used 500 synthetic contracts × 20 documents in an isolated
+collection. It reused the same single-node CPU stack.
+
+| Measure | Result |
+|---|---:|
+| Live documents embedded | **10,008** (10,000 scale + 8 demo) |
+| Full rebuild, worker time | **267.3 s** |
+| Full rebuild, wall time | **270.8 s** |
+| Vectors written | **10,008** |
+| Worker-estimated tokens | **1,260,819** |
+| Incremental edit (10 docs) | **27.4 s** to visible |
+| API p95 at c=1 / c=10 | **72.7 / 141.1 ms** |
+
+The full rebuild is about 8× the 1k run's 33.5 s for 10× the corpus, so
+throughput stays roughly flat at this size. This is still synthetic data on one
+node, not a production-scale claim.
+
+The first 10k attempt also found and fixed a real limit: a 10,008-point upsert
+in one request exceeded the Qdrant client's write timeout. The worker now
+batches upserts (256 points by default) and skips per-document stale-ID probes
+during a fresh backfill.
+
 ### Scope
 
-This is a **1,000-document, single-CPU-node, synthetic-data** benchmark. It is a baseline, not a 100k-document or production-scale claim. Results are tied to commit `ed3872f`; rerun the benchmark after changing the pipeline.
+This is a **1,000-document, single-CPU-node, synthetic-data** benchmark, plus a
+**10,000-document scale check**. It is a baseline, not a 100k-document or
+production-scale claim. The 1k snapshot is tied to commit `ed3872f`; rerun the
+benchmark after changing the pipeline.
 
 ---
 
@@ -236,6 +263,7 @@ queries.
 
 ```text
 ├── api/                  FastAPI service
+├── bench/                Reproducible scale-test harness
 ├── connect/              Debezium connector config and registration
 ├── dbt/                  Gold models, tests, and source registration
 ├── eval/                 Labelled retrieval queries + ranking metrics
@@ -257,7 +285,7 @@ queries.
 
 ## Known limitations
 
-- The benchmark uses **1,000 synthetic documents**, not production data.
+- The benchmarks use **synthetic documents** (1k primary, 10k scale check), not production data.
 - The stack runs on a **single CPU node**; no GPU or multi-node testing.
 - The worker polls every 10 s by default. Lower latency needs event-driven sync or a shorter poll.
 - The local embedding model is `bge-small-en-v1.5`; swapping models changes latency, token counts, and vector dimensions.
